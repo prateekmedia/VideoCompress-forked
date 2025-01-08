@@ -180,77 +180,86 @@ public class SwiftVideoCompressPlugin: NSObject, FlutterPlugin {
         let sourceVideoUrl = Utility.getPathUrl(path)
         let sourceVideoType = "mp4"
         
+        // Get video asset and track
         let sourceVideoAsset = avController.getVideoAsset(sourceVideoUrl)
-        let sourceVideoTrack = avController.getTrack(sourceVideoAsset)
-
-        let uuid = NSUUID()
-        let compressionUrl =
-        Utility.getPathUrl("\(Utility.basePath())/\(Utility.getFileName(path))\(uuid.uuidString).\(sourceVideoType)")
-
+        guard let sourceVideoTrack = avController.getTrack(sourceVideoAsset) else {
+            print("Error: Unable to retrieve video track.")
+            return
+        }
+        
+        // Generate a unique output path
+        let uuid = NSUUID().uuidString
+        let compressionUrl = Utility.getPathUrl("\(Utility.basePath())/\(Utility.getFileName(path))\(uuid).\(sourceVideoType)")
+        
+        // Define time range for trimming
         let timescale = sourceVideoAsset.duration.timescale
         let minStartTime = Double(startTime ?? 0)
-        
         let videoDuration = sourceVideoAsset.duration.seconds
         let minDuration = Double(duration ?? videoDuration)
         let maxDurationTime = minStartTime + minDuration < videoDuration ? minDuration : videoDuration
         
         let cmStartTime = CMTimeMakeWithSeconds(minStartTime, preferredTimescale: timescale)
         let cmDurationTime = CMTimeMakeWithSeconds(maxDurationTime, preferredTimescale: timescale)
-        let timeRange: CMTimeRange = CMTimeRangeMake(start: cmStartTime, duration: cmDurationTime)
+        let timeRange = CMTimeRangeMake(start: cmStartTime, duration: cmDurationTime)
         
-        let isIncludeAudio = includeAudio != nil ? includeAudio! : true
+        let isIncludeAudio = includeAudio ?? true
         
-        let session = getComposition(isIncludeAudio, timeRange, sourceVideoTrack!)
+        // Create composition for video processing
+        let session = getComposition(isIncludeAudio, timeRange, sourceVideoTrack)
         
-        let exporter = AVAssetExportSession(asset: session, presetName: getExportPreset(quality))!
+        // Configure AvWriter for compression
+        let avWriter = AvWriter()
+        avWriter.inputAsset = session
+        avWriter.outputURL = compressionUrl
+        avWriter.outputFileType = .mp4
+        avWriter.shouldOptimizeForNetworkUse = true
+        avWriter.bitrate = 2_000_000 // Set bitrate, default to 2000kbps
         
-        exporter.outputURL = compressionUrl
-        exporter.outputFileType = AVFileType.mp4
-        exporter.shouldOptimizeForNetworkUse = true
-        
-        if frameRate != nil {
+        // Adjust frame rate if specified
+        if let frameRate = frameRate {
             let videoComposition = AVMutableVideoComposition(propertiesOf: sourceVideoAsset)
-            videoComposition.frameDuration = CMTimeMake(value: 1, timescale: Int32(frameRate!))
-            exporter.videoComposition = videoComposition
+            videoComposition.frameDuration = CMTimeMake(value: 1, timescale: Int32(frameRate))
+            avWriter.videoComposition = videoComposition
         }
         
-        if !isIncludeAudio {
-            exporter.timeRange = timeRange
-        }
-        
+        // Clean up any existing file at the target path
         Utility.deleteFile(compressionUrl.absoluteString)
         
+        // Start export with a progress timer
         let timer = Timer.scheduledTimer(timeInterval: 0.1, target: self, selector: #selector(self.updateProgress),
-                                         userInfo: exporter, repeats: true)
+                                         userInfo: avWriter, repeats: true)
         
-        exporter.exportAsynchronously(completionHandler: {
+        avWriter.exportAsynchronously { [weak self] in
+            guard let self = self else { return }
             timer.invalidate()
-            if(self.stopCommand) {
+        
+            if self.stopCommand {
                 self.stopCommand = false
                 var json = self.getMediaInfoJson(path)
                 json["isCancel"] = true
                 let jsonString = Utility.keyValueToJson(json)
                 return result(jsonString)
             }
+        
             if deleteOrigin {
-                let fileManager = FileManager.default
                 do {
-                    if fileManager.fileExists(atPath: path) {
-                        try fileManager.removeItem(atPath: path)
+                    if FileManager.default.fileExists(atPath: path) {
+                        try FileManager.default.removeItem(atPath: path)
                     }
                     self.exporter = nil
                     self.stopCommand = false
-                }
-                catch let error as NSError {
-                    print(error)
+                } catch {
+                    print("Error deleting original file: \(error)")
                 }
             }
+        
             var json = self.getMediaInfoJson(Utility.excludeEncoding(compressionUrl.path))
             json["isCancel"] = false
             let jsonString = Utility.keyValueToJson(json)
             result(jsonString)
-        })
-        self.exporter = exporter
+        }
+        
+        self.exporter = avWriter
     }
     
     private func cancelCompression(_ result: FlutterResult) {
