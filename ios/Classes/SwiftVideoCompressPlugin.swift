@@ -174,92 +174,90 @@ public class SwiftVideoCompressPlugin: NSObject, FlutterPlugin {
         return composition    
     }
     
-    private func compressVideo(_ path: String,_ quality: NSNumber,_ deleteOrigin: Bool,_ startTime: Double?,
-                               _ duration: Double?,_ includeAudio: Bool?,_ frameRate: Int?,
-                               _ result: @escaping FlutterResult) {
+    private func compressVideo(_ path: String, _ quality: NSNumber, _ deleteOrigin: Bool, _ startTime: Double?,
+                           _ duration: Double?, _ includeAudio: Bool?, _ frameRate: Int?,
+                           _ result: @escaping FlutterResult) {
         let sourceVideoUrl = Utility.getPathUrl(path)
-        let sourceVideoType = "mp4"
-        
-        // Get video asset and track
         let sourceVideoAsset = avController.getVideoAsset(sourceVideoUrl)
         guard let sourceVideoTrack = avController.getTrack(sourceVideoAsset) else {
             print("Error: Unable to retrieve video track.")
+            result(FlutterError(code: "video_compress", message: "Failed to get video track.", details: nil))
             return
         }
-        
-        // Generate a unique output path
+    
+        // Generate output path
         let uuid = NSUUID().uuidString
-        let compressionUrl = Utility.getPathUrl("\(Utility.basePath())/\(Utility.getFileName(path))\(uuid).\(sourceVideoType)")
-        
-        // Define time range for trimming
-        let timescale = sourceVideoAsset.duration.timescale
-        let minStartTime = Double(startTime ?? 0)
-        let videoDuration = sourceVideoAsset.duration.seconds
-        let minDuration = Double(duration ?? videoDuration)
-        let maxDurationTime = minStartTime + minDuration < videoDuration ? minDuration : videoDuration
-        
-        let cmStartTime = CMTimeMakeWithSeconds(minStartTime, preferredTimescale: timescale)
-        let cmDurationTime = CMTimeMakeWithSeconds(maxDurationTime, preferredTimescale: timescale)
-        let timeRange = CMTimeRangeMake(start: cmStartTime, duration: cmDurationTime)
-        
-        let isIncludeAudio = includeAudio ?? true
-        
-        // Create composition for video processing
-        let session = getComposition(isIncludeAudio, timeRange, sourceVideoTrack)
-        
-        // Configure AvWriter for compression
-        let avWriter = AvWriter()
-        avWriter.inputAsset = session
-        avWriter.outputURL = compressionUrl
-        avWriter.outputFileType = .mp4
-        avWriter.shouldOptimizeForNetworkUse = true
-        avWriter.bitrate = 2_000_000 // Set bitrate, default to 2000kbps
-        
-        // Adjust frame rate if specified
-        if let frameRate = frameRate {
-            let videoComposition = AVMutableVideoComposition(propertiesOf: sourceVideoAsset)
-            videoComposition.frameDuration = CMTimeMake(value: 1, timescale: Int32(frameRate))
-            avWriter.videoComposition = videoComposition
-        }
-        
-        // Clean up any existing file at the target path
-        Utility.deleteFile(compressionUrl.absoluteString)
-        
-        // Start export with a progress timer
-        let timer = Timer.scheduledTimer(timeInterval: 0.1, target: self, selector: #selector(self.updateProgress),
-                                         userInfo: avWriter, repeats: true)
-        
-        avWriter.exportAsynchronously { [weak self] in
-            guard let self = self else { return }
-            timer.invalidate()
-        
-            if self.stopCommand {
-                self.stopCommand = false
-                var json = self.getMediaInfoJson(path)
-                json["isCancel"] = true
-                let jsonString = Utility.keyValueToJson(json)
-                return result(jsonString)
+        let compressionUrl = Utility.getPathUrl("\(Utility.basePath())/\(Utility.getFileName(path))\(uuid).mp4")
+    
+        // Setup writer and inputs
+        do {
+            let videoWriter = try AVAssetWriter(outputURL: compressionUrl, fileType: .mp4)
+            
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: sourceVideoTrack.naturalSize.width,
+                AVVideoHeightKey: sourceVideoTrack.naturalSize.height,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: 2_000_000, // Bitrate control (2 Mbps)
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264High40
+                ]
+            ]
+    
+            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            videoInput.expectsMediaDataInRealTime = false
+    
+            if let frameRate = frameRate {
+                videoInput.mediaTimeScale = CMTimeScale(frameRate)
             }
-        
-            if deleteOrigin {
-                do {
-                    if FileManager.default.fileExists(atPath: path) {
-                        try FileManager.default.removeItem(atPath: path)
+    
+            videoWriter.add(videoInput)
+    
+            // Audio setup if included
+            let isIncludeAudio = includeAudio ?? true
+            var audioInput: AVAssetWriterInput?
+            if isIncludeAudio, let audioTrack = sourceVideoAsset.tracks(withMediaType: .audio).first {
+                let audioSettings: [String: Any] = [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVNumberOfChannelsKey: 2,
+                    AVSampleRateKey: 44100,
+                    AVEncoderBitRateKey: 128000
+                ]
+                audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+                videoWriter.add(audioInput!)
+            }
+    
+            // Start writing
+            videoWriter.startWriting()
+            videoWriter.startSession(atSourceTime: .zero)
+    
+            let reader = try AVAssetReader(asset: sourceVideoAsset)
+            let videoReaderOutput = AVAssetReaderTrackOutput(track: sourceVideoTrack, outputSettings: nil)
+            reader.add(videoReaderOutput)
+    
+            if isIncludeAudio, let audioTrack = sourceVideoAsset.tracks(withMediaType: .audio).first {
+                let audioReaderOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+                reader.add(audioReaderOutput)
+            }
+    
+            reader.startReading()
+    
+            // Write video data
+            videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "videoQueue")) {
+                while videoInput.isReadyForMoreMediaData {
+                    if let sampleBuffer = videoReaderOutput.copyNextSampleBuffer() {
+                        videoInput.append(sampleBuffer)
+                    } else {
+                        videoInput.markAsFinished()
+                        videoWriter.finishWriting {
+                            result(Utility.excludeEncoding(compressionUrl.path))
+                        }
+                        break
                     }
-                    self.exporter = nil
-                    self.stopCommand = false
-                } catch {
-                    print("Error deleting original file: \(error)")
                 }
             }
-        
-            var json = self.getMediaInfoJson(Utility.excludeEncoding(compressionUrl.path))
-            json["isCancel"] = false
-            let jsonString = Utility.keyValueToJson(json)
-            result(jsonString)
+        } catch {
+            result(FlutterError(code: "video_compress", message: "Error initializing compression.", details: error.localizedDescription))
         }
-        
-        self.exporter = avWriter
     }
     
     private func cancelCompression(_ result: FlutterResult) {
