@@ -222,6 +222,12 @@ public class SwiftVideoCompressPlugin: NSObject, FlutterPlugin {
         return composition
     }
 
+    private func shouldProcessFrame(_ frameIndex: Int, originalFps: Double, targetFps: Double) -> Bool {
+        let ratio = originalFps / targetFps
+        let frameInterval = Double(frameIndex)
+        return frameInterval.truncatingRemainder(dividingBy: ratio) < 1.0
+    }
+
     private func compressVideo(
         _ path: String, _ quality: NSNumber, _: Bool, _: Double?,
         _: Double?, _ includeAudio: Bool?, _ frameRate: Int?, _ bitrate: Int?,
@@ -261,12 +267,14 @@ public class SwiftVideoCompressPlugin: NSObject, FlutterPlugin {
 
         // Total Frames
         let durationInSeconds = videoAsset.duration.seconds
-        var newFrameRate = videoTrack.nominalFrameRate
 
-        if frameRate != nil && Float(frameRate!) < newFrameRate {
-            newFrameRate = Float(frameRate!)
+        let ogFrameRate = Double(videoTrack.nominalFrameRate)
+        var newFrameRate = ogFrameRate
+
+        if frameRate != nil && Double(frameRate!) < newFrameRate {
+            newFrameRate = Double(frameRate!)
         }
-        let totalFrames = ceil(durationInSeconds * Double(videoTrack.nominalFrameRate))
+        let totalFrames = ceil(durationInSeconds * ogFrameRate)
 
         // Progress
         let totalUnits = Int64(totalFrames)
@@ -329,7 +337,9 @@ public class SwiftVideoCompressPlugin: NSObject, FlutterPlugin {
         let processingQueue = DispatchQueue(label: "processingQueue1", qos: .background)
 
         var isFirstBuffer = true
-        var frameCount = Int(0)
+        var frameCount = 0
+        var frameIndex = 0
+        
         videoWriterInput.requestMediaDataWhenReady(
             on: processingQueue,
             using: { () in
@@ -345,19 +355,34 @@ public class SwiftVideoCompressPlugin: NSObject, FlutterPlugin {
                         return result(jsonString)
                     }
 
-                    // Update progress based on number of processed frames
-                    let presentationTime: CMTime = CMTimeMake(
-                        value: Int64(frameCount * (1000 / Int(newFrameRate))), timescale: 1000
+                    // Calculate the correct presentation time maintaining original speed
+                    let currentTime: CMTime = CMTimeMake(
+                        value: Int64(frameCount) * 1000,
+                        timescale: Int32(newFrameRate * 1000)
                     )
 
-                    frameCount += 1
-                    self.updateProgress(Double(frameCount) / Double(totalFrames))
+                    frameIndex += 1
+                    self.updateProgress(Double(frameIndex) / Double(totalFrames))
 
                     let sampleBuffer: CMSampleBuffer? = videoReaderOutput.copyNextSampleBuffer()
 
                     if videoReader?.status == .reading, sampleBuffer != nil {
-                        let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer!)
-                        writerAdaptor.append(pixelBuffer!, withPresentationTime: presentationTime)
+                        var shouldInclude = true
+                        // Only process frames at desired intervals when reducing frame rate
+                        if newFrameRate < ogFrameRate {
+                            shouldInclude = self.shouldProcessFrame(
+                                frameIndex,
+                                originalFps: ogFrameRate,
+                                targetFps: newFrameRate
+                            )
+                        }
+                        if shouldInclude {
+                            let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer!)
+                            if currentTime <= videoAsset.duration {
+                                writerAdaptor.append(pixelBuffer!, withPresentationTime: currentTime)
+                                frameCount += 1
+                            }
+                        }
                     } else {
                         videoWriterInput.markAsFinished()
                         if videoReader?.status == .completed {
@@ -418,7 +443,7 @@ public class SwiftVideoCompressPlugin: NSObject, FlutterPlugin {
         )
     }
 
-    private func getVideoWriterSettings(bitrate: Int, width: Int, height: Int, frameRate: Float)
+    private func getVideoWriterSettings(bitrate: Int, width: Int, height: Int, frameRate: Double)
         -> [String: AnyObject]
     {
         let videoWriterCompressionSettings: [String: Any] = [
